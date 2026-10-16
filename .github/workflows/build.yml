@@ -48,7 +48,7 @@ jobs:
       - name: Build frontend
         working-directory: src/frontend
         run: |
-          pnpm install --frozen-lockfile --dangerously-allow-all-builds
+          pnpm install --dangerously-allow-all-builds
           pnpm run build
 
       - name: Build backend (embed frontend)
