@@ -1,0 +1,248 @@
+diff --git a/backend/internal/service/ops_alert_evaluator_service.go b/backend/internal/service/ops_alert_evaluator_service.go
+index 5ee5460..882f8e2 100644
+--- a/backend/internal/service/ops_alert_evaluator_service.go
++++ b/backend/internal/service/ops_alert_evaluator_service.go
+@@ -1,9 +1,13 @@
+ package service
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"math"
++	"net/http"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -50,6 +54,9 @@ type OpsAlertEvaluatorService struct {
+ 	ruleStates map[int64]*opsAlertRuleState
+ 
+ 	emailLimiter *slidingWindowLimiter
++	feishuClient *http.Client
++	feishuMu     sync.Mutex
++	feishuAt     time.Time
+ 
+ 	skipLogMu sync.Mutex
+ 	skipLogAt time.Time
+@@ -199,6 +206,7 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
+ 	eventsCreated := 0
+ 	eventsResolved := 0
+ 	emailsSent := 0
++	feishuSent := 0
+ 
+ 	now := time.Now().UTC()
+ 	safeEnd := now.Truncate(time.Minute)
+@@ -295,6 +303,9 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
+ 				if s.maybeSendAlertEmail(ctx, runtimeCfg, rule, created) {
+ 					emailsSent++
+ 				}
++				if s.maybeSendAlertFeishu(ctx, runtimeCfg, rule, created, OpsAlertStatusFiring, nil) {
++					feishuSent++
++				}
+ 			}
+ 			continue
+ 		}
+@@ -306,11 +317,17 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
+ 				logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] resolve event failed (event=%d): %v", activeEvent.ID, err)
+ 			} else {
+ 				eventsResolved++
++				resolvedEvent := *activeEvent
++				resolvedEvent.Status = OpsAlertStatusResolved
++				resolvedEvent.ResolvedAt = &resolvedAt
++				if s.maybeSendAlertFeishu(ctx, runtimeCfg, rule, &resolvedEvent, OpsAlertStatusResolved, &resolvedAt) {
++					feishuSent++
++				}
+ 			}
+ 		}
+ 	}
+ 
+-	result := truncateString(fmt.Sprintf("rules=%d enabled=%d evaluated=%d created=%d resolved=%d emails_sent=%d", rulesTotal, rulesEnabled, rulesEvaluated, eventsCreated, eventsResolved, emailsSent), 2048)
++	result := truncateString(fmt.Sprintf("rules=%d enabled=%d evaluated=%d created=%d resolved=%d emails_sent=%d feishu_sent=%d", rulesTotal, rulesEnabled, rulesEvaluated, eventsCreated, eventsResolved, emailsSent, feishuSent), 2048)
+ 	s.recordHeartbeatSuccess(runAt, time.Since(startedAt), result)
+ }
+ 
+@@ -747,6 +764,98 @@ func (s *OpsAlertEvaluatorService) maybeSendAlertEmail(ctx context.Context, runt
+ 	return anySent
+ }
+ 
++// maybeSendAlertFeishu 定制功能：把告警事件推送到飞书群机器人（不依赖邮件配置）
++func (s *OpsAlertEvaluatorService) maybeSendAlertFeishu(ctx context.Context, runtimeCfg *OpsAlertRuntimeSettings, rule *OpsAlertRule, event *OpsAlertEvent, status string, resolvedAt *time.Time) bool {
++	if s == nil || s.opsService == nil || event == nil || rule == nil {
++		return false
++	}
++
++	feishuCfg, err := s.opsService.GetEmailNotificationConfig(ctx)
++	if err != nil || feishuCfg == nil || !feishuCfg.Feishu.Enabled {
++		return false
++	}
++	webhookURL := strings.TrimSpace(feishuCfg.Feishu.WebhookURL)
++	if webhookURL == "" || !strings.HasPrefix(webhookURL, "https://") {
++		return false
++	}
++	if !shouldSendOpsAlertEmailByMinSeverity(strings.TrimSpace(feishuCfg.Feishu.MinSeverity), strings.TrimSpace(rule.Severity)) {
++		return false
++	}
++	if runtimeCfg != nil && runtimeCfg.Silencing.Enabled {
++		if isOpsAlertSilenced(time.Now().UTC(), rule, event, runtimeCfg.Silencing) {
++			return false
++		}
++	}
++
++	text := buildOpsAlertFeishuText(rule, event, status, resolvedAt)
++	return s.sendFeishuText(webhookURL, text)
++}
++
++func buildOpsAlertFeishuText(rule *OpsAlertRule, event *OpsAlertEvent, status string, resolvedAt *time.Time) string {
++	severity := strings.TrimSpace(rule.Severity)
++	name := strings.TrimSpace(rule.Name)
++	desc := strings.TrimSpace(event.Description)
++	tz := time.FixedZone("CST", 8*3600)
++	if status == OpsAlertStatusResolved {
++		at := "-"
++		if resolvedAt != nil {
++			at = resolvedAt.In(tz).Format("2006-01-02 15:04:05")
++		}
++		return fmt.Sprintf("✅ [Sub2API 告警恢复]\n规则: %s\n级别: %s\n描述: %s\n恢复时间: %s", name, severity, desc, at)
++	}
++	firedAt := event.FiredAt.In(tz).Format("2006-01-02 15:04:05")
++	icon := "🚨"
++	if severity == "P1" {
++		icon = "⚠️"
++	}
++	return fmt.Sprintf("%s [Sub2API 告警]\n规则: %s\n级别: %s\n描述: %s\n触发时间: %s", icon, name, severity, desc, firedAt)
++}
++
++// sendFeishuText 发送飞书 text 消息，失败仅记录日志（best-effort）
++func (s *OpsAlertEvaluatorService) sendFeishuText(webhookURL, text string) bool {
++	if s == nil || text == "" {
++		return false
++	}
++	// 简单节流：两次推送至少间隔 1 秒，避免规则同时触发时打爆机器人
++	s.feishuMu.Lock()
++	if wait := time.Second - time.Since(s.feishuAt); wait > 0 {
++		time.Sleep(wait)
++	}
++	s.feishuAt = time.Now()
++	s.feishuMu.Unlock()
++
++	if s.feishuClient == nil {
++		s.feishuClient = &http.Client{Timeout: 8 * time.Second}
++	}
++	payload, err := json.Marshal(map[string]any{
++		"msg_type": "text",
++		"content":  map[string]string{"text": text},
++	})
++	if err != nil {
++		return false
++	}
++	resp, err := s.feishuClient.Post(webhookURL, "application/json", bytes.NewReader(payload))
++	if err != nil {
++		logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] feishu push failed: %v", err)
++		return false
++	}
++	defer resp.Body.Close()
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
++	if resp.StatusCode != http.StatusOK {
++		logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] feishu push http %d: %s", resp.StatusCode, string(body))
++		return false
++	}
++	var fr struct {
++		Code int    `json:"code"`
++		Msg  string `json:"msg"`
++	}
++	if json.Unmarshal(body, &fr) == nil && fr.Code != 0 {
++		logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] feishu push rejected: code=%d msg=%s", fr.Code, fr.Msg)
++		return false
++	}
++	return true
++}
++
+ func opsAlertEmailVariables(rule *OpsAlertRule, event *OpsAlertEvent) map[string]string {
+ 	variables := map[string]string{
+ 		"rule_name":         "-",
+diff --git a/backend/internal/service/ops_settings.go b/backend/internal/service/ops_settings.go
+index 2b18b48..dac8dab 100644
+--- a/backend/internal/service/ops_settings.go
++++ b/backend/internal/service/ops_settings.go
+@@ -94,6 +94,12 @@ func (s *OpsService) UpdateEmailNotificationConfig(ctx context.Context, req *Ops
+ 		cfg.Report.AccountHealthErrorRateThreshold = req.Report.AccountHealthErrorRateThreshold
+ 	}
+ 
++	if req.Feishu != nil {
++		cfg.Feishu.Enabled = req.Feishu.Enabled
++		cfg.Feishu.WebhookURL = strings.TrimSpace(req.Feishu.WebhookURL)
++		cfg.Feishu.MinSeverity = strings.TrimSpace(req.Feishu.MinSeverity)
++	}
++
+ 	if err := validateOpsEmailNotificationConfig(cfg); err != nil {
+ 		return nil, err
+ 	}
+@@ -133,6 +139,11 @@ func defaultOpsEmailNotificationConfig() *OpsEmailNotificationConfig {
+ 			AccountHealthSchedule:           "0 9 * * *",
+ 			AccountHealthErrorRateThreshold: 10.0,
+ 		},
++		Feishu: OpsFeishuAlertConfig{
++			Enabled:     false,
++			WebhookURL:  "",
++			MinSeverity: "",
++		},
+ 	}
+ }
+ 
+@@ -148,6 +159,8 @@ func normalizeOpsEmailNotificationConfig(cfg *OpsEmailNotificationConfig) {
+ 	}
+ 
+ 	cfg.Alert.MinSeverity = strings.TrimSpace(cfg.Alert.MinSeverity)
++	cfg.Feishu.WebhookURL = strings.TrimSpace(cfg.Feishu.WebhookURL)
++	cfg.Feishu.MinSeverity = strings.TrimSpace(cfg.Feishu.MinSeverity)
+ 	cfg.Report.DailySummarySchedule = strings.TrimSpace(cfg.Report.DailySummarySchedule)
+ 	cfg.Report.WeeklySummarySchedule = strings.TrimSpace(cfg.Report.WeeklySummarySchedule)
+ 	cfg.Report.ErrorDigestSchedule = strings.TrimSpace(cfg.Report.ErrorDigestSchedule)
+@@ -185,6 +198,18 @@ func validateOpsEmailNotificationConfig(cfg *OpsEmailNotificationConfig) error {
+ 		return errors.New("alert.min_severity must be one of: critical, warning, info, or empty")
+ 	}
+ 
++	switch strings.TrimSpace(cfg.Feishu.MinSeverity) {
++	case "", "critical", "warning", "info":
++	default:
++		return errors.New("feishu.min_severity must be one of: critical, warning, info, or empty")
++	}
++	if cfg.Feishu.Enabled {
++		u := strings.TrimSpace(cfg.Feishu.WebhookURL)
++		if u == "" || !strings.HasPrefix(u, "https://") {
++			return errors.New("feishu.webhook_url must be a valid https URL when feishu is enabled")
++		}
++	}
++
+ 	if cfg.Report.ErrorDigestMinCount < 0 {
+ 		return errors.New("report.error_digest_min_count must be >= 0")
+ 	}
+diff --git a/backend/internal/service/ops_settings_models.go b/backend/internal/service/ops_settings_models.go
+index 8a32d7a..1a9e7a1 100644
+--- a/backend/internal/service/ops_settings_models.go
++++ b/backend/internal/service/ops_settings_models.go
+@@ -5,6 +5,14 @@ package service
+ type OpsEmailNotificationConfig struct {
+ 	Alert  OpsEmailAlertConfig  `json:"alert"`
+ 	Report OpsEmailReportConfig `json:"report"`
++	Feishu OpsFeishuAlertConfig `json:"feishu"`
++}
++
++// OpsFeishuAlertConfig 飞书群机器人告警推送配置（定制功能）
++type OpsFeishuAlertConfig struct {
++	Enabled     bool   `json:"enabled"`
++	WebhookURL  string `json:"webhook_url"`
++	MinSeverity string `json:"min_severity"`
+ }
+ 
+ type OpsEmailAlertConfig struct {
+@@ -36,6 +44,7 @@ type OpsEmailReportConfig struct {
+ type OpsEmailNotificationConfigUpdateRequest struct {
+ 	Alert  *OpsEmailAlertConfig  `json:"alert"`
+ 	Report *OpsEmailReportConfig `json:"report"`
++	Feishu *OpsFeishuAlertConfig `json:"feishu"`
+ }
+ 
+ type OpsDistributedLockSettings struct {

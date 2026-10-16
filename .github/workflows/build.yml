@@ -1,0 +1,73 @@
+name: Build sub2api-feishu
+
+on:
+  push:
+    paths: ['UPSTREAM_TAG', 'patches/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag (e.g. v0.2.17). Empty = use UPSTREAM_TAG'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG=$(cat UPSTREAM_TAG | tr -d '[:space:]')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building upstream $TAG with feishu patch"
+
+      - name: Fetch upstream source
+        run: git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" https://github.com/Wei-Shaw/sub2api.git src
+
+      - name: Apply feishu patch
+        run: |
+          cd src
+          git apply --check --verbose ../patches/feishu-alert-webhook.patch
+          git apply ../patches/feishu-alert-webhook.patch
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/backend/go.mod
+
+      - name: Build frontend
+        working-directory: src/frontend
+        run: |
+          pnpm install --frozen-lockfile --dangerously-allow-all-builds
+          pnpm run build
+
+      - name: Build backend (embed frontend)
+        working-directory: src/backend
+        run: |
+          VER="${{ steps.tag.outputs.tag }}-feishu.1"
+          CGO_ENABLED=0 go build -tags embed -trimpath \
+            -ldflags "-s -w -X main.Version=$VER" \
+            -o "sub2api-$VER-linux-amd64" ./cmd/server
+          sha256sum "sub2api-$VER-linux-amd64" > "sub2api-$VER-linux-amd64.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}-feishu.1
+          name: sub2api ${{ steps.tag.outputs.tag }}-feishu.1
+          body: |
+            Upstream ${{ steps.tag.outputs.tag }} + feishu alert webhook patch.
+            Auto-built by GitHub Actions. Server deploy: /root/scripts/sub2api_upgrade_ci.sh
+          files: |
+            src/backend/sub2api-*-linux-amd64
+            src/backend/sub2api-*-linux-amd64.sha256
