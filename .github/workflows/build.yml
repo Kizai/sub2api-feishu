@@ -47,9 +47,17 @@ jobs:
 
       - name: Build frontend
         working-directory: src/frontend
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
         run: |
+          set -o pipefail
           pnpm install --no-frozen-lockfile --dangerously-allow-all-builds
-          pnpm run build
+          echo "::group::typecheck (vue-tsc)"
+          npx vue-tsc -b
+          echo "::endgroup::"
+          echo "::group::vite build"
+          pnpm exec vite build
+          echo "::endgroup::"
 
       - name: Build backend (embed frontend)
         working-directory: src/backend
