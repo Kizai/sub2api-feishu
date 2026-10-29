@@ -63,14 +63,21 @@ jobs:
         if: failure()
         run: |
           {
-            echo "### Frontend build debug"
-            echo "node=$(node -v) pnpm=$(pnpm -v)"
-            echo '```'
+            echo "run=$GITHUB_RUN_ID node=$(node -v) pnpm=$(pnpm -v)"
             for f in /tmp/fe-install.log /tmp/fe-tsc.log /tmp/fe-vite.log; do
-              [ -f "$f" ] && { echo "==== $f (tail 80) ===="; tail -80 "$f"; }
+              [ -f "$f" ] && { echo "==== $f ===="; cat "$f"; }
             done
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > /tmp/fe-logs-$GITHUB_RUN_ID.txt
+          cat /tmp/fe-logs-$GITHUB_RUN_ID.txt
+
+      - name: Publish debug logs to release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-debug
+          name: CI debug logs
+          body: Auto-uploaded frontend build logs from failed runs
+          files: /tmp/fe-logs-*.txt
 
       - name: Build backend (embed frontend)
         working-directory: src/backend
