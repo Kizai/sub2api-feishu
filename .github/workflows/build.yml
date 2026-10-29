@@ -29,18 +29,21 @@ jobs:
       - name: Fetch upstream source
         run: git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" https://github.com/Wei-Shaw/sub2api.git src
 
-      - name: Apply feishu patch
+      - name: Apply patches
         run: |
           cd src
-          git apply --check --verbose ../patches/feishu-alert-webhook.patch
-          git apply ../patches/feishu-alert-webhook.patch
+          for p in ../patches/*.patch; do
+            echo "applying $p"
+            git apply --check --verbose "$p"
+            git apply "$p"
+          done
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: 11.28.9
       - uses: actions/setup-go@v5
         with:
           go-version-file: src/backend/go.mod
