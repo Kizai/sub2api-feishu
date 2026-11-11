@@ -1,8 +1,8 @@
 diff --git a/frontend/package.json b/frontend/package.json
-index fa12747..3452edd 100644
+index e42bcb0..fdf6213 100644
 --- a/frontend/package.json
 +++ b/frontend/package.json
-@@ -59,15 +59,5 @@
+@@ -59,16 +59,5 @@
      "vite-plugin-checker": "^0.9.1",
      "vitest": "^2.1.9",
      "vue-tsc": "^2.2.0"
@@ -14,20 +14,22 @@ index fa12747..3452edd 100644
 -      "postcss@<8.5.18": ">=8.5.18",
 -      "dompurify@<3.4.17": ">=3.4.17",
 -      "source-map-js@<1.2.2": ">=1.2.2",
--      "follow-redirects@<1.16.1": ">=1.16.1"
+-      "follow-redirects@<1.16.2": ">=1.16.2",
+-      "decode-uri-component@<0.5.1": ">=0.5.1"
 -    }
    }
  }
 diff --git a/frontend/pnpm-workspace.yaml b/frontend/pnpm-workspace.yaml
 new file mode 100644
-index 0000000..54e7c75
+index 0000000..3aea41a
 --- /dev/null
 +++ b/frontend/pnpm-workspace.yaml
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +overrides:
 +  js-cookie: 3.0.7
 +  form-data@<4.0.6: '>=4.0.6'
 +  postcss@<8.5.18: '>=8.5.18'
 +  dompurify@<3.4.17: '>=3.4.17'
 +  source-map-js@<1.2.2: '>=1.2.2'
-+  follow-redirects@<1.16.1: '>=1.16.1'
++  follow-redirects@<1.16.2: '>=1.16.2'
++  decode-uri-component@<0.5.1: '>=0.5.1'
